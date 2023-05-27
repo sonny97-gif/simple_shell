@@ -1,336 +1,234 @@
-#ifndef SHELL_H
-#define SHELL_H
-/*-------------------------------------------------------------*
- *		Includes and dependencies			*
- *-------------------------------------------------------------*/
+#ifndef _SHELL_H_
+#define _SHELL_H_
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdarg.h>
-#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <errno.h>
 
-#ifdef ARDUINO
-#include <Arduino.h>
-#ifdef ESP8266
-#include <pgmspace.h>
-#else
-#include <avr/pgmspace.h>
-#endif
-#endif
+/* for read/write buffers */
+#define READ_BUF_SIZE 1024
+#define WRITE_BUF_SIZE 1024
+#define BUF_FLUSH -1
 
-/*-------------------------------------------------------------*
- *		Library Configuration				*
- *-------------------------------------------------------------*/
+/* for command chaining */
+#define CMD_NORM	0
+#define CMD_OR		1
+#define CMD_AND		2
+#define CMD_CHAIN	3
 
-/**
- * You can configure several operation parameters of the shell library here
- */
+/* for convert_number() */
+#define CONVERT_LOWERCASE	1
+#define CONVERT_UNSIGNED	2
 
-#if !defined(CONFIG_SHELL_MAX_COMMANDS)
-/**
- * Defines the maximum number of commands that can be registered
- */
-#define CONFIG_SHELL_MAX_COMMANDS		5
-#endif
-#if !defined(CONFIG_SHELL_MAX_INPUT)
-/**
- * Defines the maximum characters that the input buffer can accept
- */
-#define CONFIG_SHELL_MAX_INPUT			70
-#endif
-#if !defined(CONFIG_SHELL_MAX_COMMAND_ARGS)
-/**
- * Configures the maximum number of arguments per command that can be accepted
- */
-#define CONFIG_SHELL_MAX_COMMAND_ARGS		10
-#endif
+/* 1 if using system getline() */
+#define USE_GETLINE 0
+#define USE_STRTOK 0
 
-#if !defined(CONFIG_SHELL_FMT_BUFFER)
-/**
- * Defines the buffer for formatted string output from program memory.
- * THIS SETTING IS USED ONLY FOR ARDUINO BOARDS
- */
-#define CONFIG_SHELL_FMT_BUFFER			70
-#endif
+#define HIST_FILE	".simple_shell_history"
+#define HIST_MAX	4096
+
+extern char **environ;
+
 
 /**
- * End of user configurable parameters, do not touch anything below this line
+ * struct liststr - singly linked list
+ * @num: the number field
+ * @str: a string
+ * @next: points to the next node
  */
-
-/*-------------------------------------------------------------*
- *		Macros & definitions				*
- *-------------------------------------------------------------*/
-#define SHELL_ASCII_NUL				0x00
-#define SHELL_ASCII_BEL				0x07
-#define SHELL_ASCII_BS				0x08
-#define SHELL_ASCII_HT				0x09
-#define SHELL_ASCII_LF				0x0A
-#define SHELL_ASCII_CR				0x0D
-#define SHELL_ASCII_ESC				0x1B
-#define SHELL_ASCII_DEL				0x7F
-#define SHELL_ASCII_US				0x1F
-#define SHELL_ASCII_SP				0x20
-#define SHELL_VT100_ARROWUP			'A'
-#define SHELL_VT100_ARROWDOWN			'B'
-#define SHELL_VT100_ARROWRIGHT			'C'
-#define SHELL_VT100_ARROWLEFT			'D'
-
-#define SHELL_RET_SUCCESS			0
-#define SHELL_RET_FAILURE			1
-#define SHELL_RET_IOPENDING			-1
-
-#define SHELL_VERSION_STRING			"1.2.0"
-
-/*-------------------------------------------------------------*
- *		Typedefs enums & structs			*
- *-------------------------------------------------------------*/
+typedef struct liststr
+{
+	int num;
+	char *str;
+	struct liststr *next;
+} list_t;
 
 /**
- *  Type definition for all the programs invoked by the shell (function pointer)
+ * struct passinfo - contains pseudo-arguements to pass into a function,
+ * allowing uniform prototype for function pointer struct
+ * @arg: a string generated from getline containing arguements
+ * @argv:an array of strings generated from arg
+ * @path: a string path for the current command
+ * @argc: the argument count
+ * @line_count: the error count
+ * @err_num: the error code for exit()s
+ * @linecount_flag: if on count this line of input
+ * @fname: the program filename
+ * @env: linked list local copy of environ
+ * @environ: custom modified copy of environ from LL env
+ * @history: the history node
+ * @alias: the alias node
+ * @env_changed: on if environ was changed
+ * @status: the return status of the last exec'd command
+ * @cmd_buf: address of pointer to cmd_buf, on if chaining
+ * @cmd_buf_type: CMD_type ||, &&, ;
+ * @readfd: the fd from which to read line input
+ * @histcount: the history line number count
  */
-typedef int (*shell_program_t) (int, char **);
+typedef struct passinfo
+{
+	char *arg;
+	char **argv;
+	char *path;
+	int argc;
+	unsigned int line_count;
+	int err_num;
+	int linecount_flag;
+	char *fname;
+	list_t *env;
+	list_t *history;
+	list_t *alias;
+	char **environ;
+	int env_changed;
+	int status;
 
-/*
- * Type definition for a function that sends a single character to the remote
- * terminal screen (function pointer)
- */
-typedef void (*shell_writer_t) (char);
+	char **cmd_buf; /* pointer to cmd ; chain buffer, for memory mangement */
+	int cmd_buf_type; /* CMD_type ||, &&, ; */
+	int readfd;
+	int histcount;
+} info_t;
 
-/*
- * Type definition for a function that reads a single character from the remote
- * terminal (function pointer)
- */
-typedef int (*shell_reader_t) (char *);
-
-/*
- * Type definition for a function that sends multiple chars to the remote
- * terminal (function pointer)
- */
-typedef void (*shell_bwriter_t)(char *, uint8_t);
+#define INFO_INIT \
+{NULL, NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, \
+		0, 0, 0}
 
 /**
- * This enumeration defines the errors printed by the programs called by the
- * shell.
+ * struct builtin - contains a builtin string and related function
+ * @type: the builtin command flag
+ * @func: the function
  */
-enum shell_errors {
-	/** There are missing arguments for the command */
-	E_SHELL_ERR_ARGCOUNT = 0,
-	/** The program received an argument that is out of range */
-	E_SHELL_ERR_OUTOFRANGE,
-	/** The program received an argument with a value different than expected */
-	E_SHELL_ERR_VALUE,
-	/** Invalid action requested for the current state */
-	E_SHELL_ERR_ACTION,
-	/** Cannot parse the user input */
-	E_SHELL_ERR_PARSE,
-	/** Cannot access storage device or memory device */
-	E_SHELL_ERR_STORAGE,
-	/** IO device error caused program interruption */
-	E_SHELL_ERR_IO,
-	/** Other kinds of errors */
-	E_SHELL_ERROR_UNKNOWN,
-};
+typedef struct builtin
+{
+	char *type;
+	int (*func)(info_t *);
+} builtin_table;
 
-/**
- * This structure holds the data for every command registered on the shell
- */
-struct shell_command_entry {
-	shell_program_t shell_program;
-	const char * shell_command_string;
-};
 
-struct shell_outbuffer_data {
-	char outbuffer[30];
-	shell_bwriter_t shell_bwriter;
-	uint32_t buffertimer;
-	uint8_t buffercount;
-};
+/* toem_shloop.c */
+int hsh(info_t *, char **);
+int find_builtin(info_t *);
+void find_cmd(info_t *);
+void fork_cmd(info_t *);
 
-/*-------------------------------------------------------------*
- *		Function prototypes				*
- *-------------------------------------------------------------*/
-#ifdef	__cplusplus
-extern "C" {
-#endif
-	/**
-	 * @brief Prepares the command line interface
-	 *
-	 * Initializes the resources used by the command line interface. The main
-	 * 'program' for the command line interface where all the data is handled is
-	 * shell_task().
-	 *
-	 * @param reader The callback function used to get a character from the stream.
-	 * @param writer The callback function used to write a character to the stream.
-	 * @param msg The message to display upon startup of the program
-	 *
-	 * @return Returns true if the shell was successfully initialized, returns false
-	 * otherwise.
-	 */
-	bool shell_init(shell_reader_t reader, shell_writer_t writer, char * msg);
-	
-	/**
-	 * @brief Enables internal output buffer for output chars
-	 * 
-	 * Call this function to enable the use of an internal buffer to temporary store
-	 * characters that will be sent to a remote device. This function is meant to be
-	 * used when the communication channel performs better when many characters are 
-	 * written at the same time. For example TCP/IP sockets perform better if a group 
-	 * of characters are sent on a single segment.
-	 * 
-	 * The content of the internal buffer is written when the it is full or if
-	 * 200 milliseconds have elapsed since the last character write on the buffer.
-	 * 
-         * @param writer The callback function used to write a group of characters on the
-	 * stream.
-         */
-	void shell_use_buffered_output(shell_bwriter_t writer);
+/* toem_parser.c */
+int is_cmd(info_t *, char *);
+char *dup_chars(char *, int, int);
+char *find_path(info_t *, char *, char *);
 
-	/**
-	 * @brief Registers a command with the command line library
-	 *
-	 * Registers a command on the available command list. The name of the command
-	 * and the function that implements it's functionality should be provided.
-	 *
-	 * @param program The type shell_program_t is a pointer to a function
-	 * that is executed when the command written by user matches an entry on the
-	 * command list.
-	 * @param string A string containing the name of the command to be registered.
-	 *
-	 * @return Returns true if command was successfully added to the command list,
-	 * or returns false if something fails (no more commands can be registered).
-	 */
-	bool shell_register(shell_program_t program, const char * string);
+/* loophsh.c */
+int loophsh(char **);
 
-	/**
-	 * @brief Unregister all commands
-	 *
-	 * Erases all entries on the command list, returning it to it's default status.
-	 */
-	void shell_unregister_all();
+/* toem_errors.c */
+void _eputs(char *);
+int _eputchar(char);
+int _putfd(char c, int fd);
+int _putsfd(char *str, int fd);
 
-	/**
-	 * @brief Prints a character to the terminal
-	 * 
-	 * Prints a single character to the terminal screen, it exposes the functionality
-	 * of the shell_writer callback function
-	 * 
-	 * @param c A character to print to the terminal screen
-	 */
-	void shell_putc(char c);
+/* toem_string.c */
+size_t _strlen(const char *s);
+int _strcmp(const char *s1, const char *s2);
+char *_strcat(char *dest, const char *src);
 
-	/**
-	 * @brief Prints a null terminated string to the terminal
-	 *
-	 * Displays a string on the terminal. The string should be null terminated.
-	 *
-	 * @param string The string to send to the terminal
-	 */
-	void shell_print(const char * string);
+/* toem_string1.c */
+char *_strcpy(char *, char *);
+char *_strdup(const char *);
+void _puts(char *);
+int _putchar(char);
 
-	/**
-	 * @brief Prints a string and moves the cursor to the next line
-	 *
-	 * Displays a string on the terminal and moves the cursor to the next line. The
-	 * string should be null terminated.
-	 *
-	 * @param string The string to send to the terminal
-	 */
-	void shell_println(const char * string);
+/* toem_exits.c */
+char *_strncpy(char *, char *, int);
+char *_strncat(char *, char *, int);
+char *_strchr(char *, char);
 
-	/**
-	 * @brief Prints formatted text to the terminal
-	 *
-	 * Displays a string on the terminal. If the string includes format
-	 * specifiers (subsequences beginning with '%'), the additional arguments
-	 * following format string are formatted and inserted in the resulting string
-	 * replacing their respective specifiers.
-	 *
-	 * This function implements it's own mechanism for text formatting. It does not
-	 * rely on the native print functions.
-	 *
-	 * @param fmt The string to send to the terminal, the string can include format
-	 * specifiers in a similar fashion to printf standard function.
-	 *
-	 * @param ... Aditional arguments that are inserted on the string as text
-	 */
-	void shell_printf(const char * fmt, ...);
+/* toem_tokenizer.c */
+char **strtow(char *, char *);
+char **strtow2(char *, char);
 
-	/**
-	 * @brief Prints the list of registered commands
-	 *
-	 * Prints a list of available commands to the terminal using the callback
-	 * functions provided on initialization.
-	 */
-	void shell_print_commands();
+/* toem_realloc.c */
+char *_memset(char *, char, unsigned int);
+void ffree(char **);
+void *_realloc(void *, unsigned int, unsigned int);
 
-	/**
-	 * @brief Prints error messages to the terminal screen
-	 *
-	 * This function presents an alternative for displaying program errors in a
-	 * uniform format.
-	 *
-	 * @param error The code (ID) of the error to print
-	 *
-	 * @param field The name of the parameter or variable where the error was
-	 * detected.
-	 */
-	void shell_print_error(int error, const char * field);
+/* toem_memory.c */
+int bfree(void **);
 
-	/**
-	 * @brief Main Shell processing loop
-	 *
-	 * This function implements the main functionality of the command line interface
-	 * this function should be called frequently so it can handle the input from the
-	 * data stream.
-	 */
-	void shell_task();
+/* toem_atoi.c */
+int interactive(info_t *);
+int is_delim(char, char *);
+int _isalpha(int);
+int _atoi(char *);
 
-#ifdef ARDUINO
-	/**
-	 * @brief Prints a null terminated string to the terminal from flash
-	 *
-	 * Displays a string on the terminal. The string should be null terminated.
-	 * This function is designed to be used with strings stored in flash on the
-	 * arduino platform.
-	 *
-	 * @param string The string to send to the terminal
-	 */
-	void shell_print_pm(const char * string);
+/* toem_errors1.c */
+int _erratoi(char *);
+void print_error(info_t *, char *);
+int print_d(int, int);
+char *convert_number(long int, int, int);
+void remove_comments(char *);
 
-	/**
-	 * @brief Prints a string from flash and moves the cursor to the next line
-	 *
-	 * Displays a string on the terminal and moves the cursor to the next line. The
-	 * string should be null terminated. This function is designed to be used with
-	 * strings stored in flash on the arduino platform.
-	 *
-	 * @param string The string to send to the terminal
-	 */
-	void shell_println_pm(const char * string);
+/* toem_builtin.c */
+int _myexit(info_t *);
+int _mycd(info_t *);
+int _myhelp(info_t *);
 
-	/**
-	 * @brief Prints formatted text to the terminal from flash
-	 *
-	 * Displays a string (fmt) on the terminal. If the string includes format
-	 * specifiers (subsequences beginning with '%'), the additional arguments
-	 * following format are formatted and inserted in the resulting string
-	 * replacing their respective specifiers.
-	 * 
-	 * This function is designed to be used with strings stored in flash.
-	 *
-	 * This function implements it's own mechanism for text formatting. It doesn't
-	 * rely on the native print functions.
-	 *
-	 * @param fmt The string to send to the terminal, the string can include format
-	 * specifiers in a similar fashion to printf standard function.
-	 *
-	 * @param ... Aditional arguments that are inserted on the string as text
-	 */
-	void shell_printf_pm(const char * fmt, ...);
-#endif
+/* toem_builtin1.c */
+int _myhistory(info_t *);
+int _myalias(info_t *);
 
-#ifdef	__cplusplus
-}
-#endif
+/*toem_getline.c */
+ssize_t get_input(info_t *);
+int _getline(info_t *, char **, size_t *);
+void sigintHandler(int);
+
+/* toem_getinfo.c */
+void clear_info(info_t *);
+void set_info(info_t *, char **);
+void free_info(info_t *, int);
+
+/* toem_environ.c */
+char *_getenv(info_t *, const char *);
+int _myenv(info_t *);
+int _mysetenv(info_t *);
+int _myunsetenv(info_t *);
+int populate_env_list(info_t *);
+
+/* toem_getenv.c */
+char **get_environ(info_t *);
+int _unsetenv(info_t *, char *);
+int _setenv(info_t *, char *, char *);
+
+/* toem_history.c */
+char *get_history_file(info_t *info);
+int write_history(info_t *info);
+int read_history(info_t *info);
+int build_history_list(info_t *info, char *buf, int linecount);
+int renumber_history(info_t *info);
+
+/* toem_lists.c */
+list_t *add_node(list_t **, const char *, int);
+list_t *add_node_end(list_t **, const char *, int);
+size_t print_list_str(const list_t *);
+int delete_node_at_index(list_t **, unsigned int);
+void free_list(list_t **);
+
+/* toem_lists1.c */
+size_t list_len(const list_t *);
+char **list_to_strings(list_t *);
+size_t print_list(const list_t *);
+list_t *node_starts_with(list_t *, char *, char);
+ssize_t get_node_index(list_t *, list_t *);
+
+/* toem_vars.c */
+int is_chain(info_t *, char *, size_t *);
+void check_chain(info_t *, char *, size_t *, size_t, size_t);
+int replace_alias(info_t *);
+int replace_vars(info_t *);
+int replace_string(char **, char *);
 
 #endif
-// End of Header file
